@@ -2,6 +2,7 @@ package transport_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -11,6 +12,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// failWriter satisfies io.ReadWriter; Write always returns an error.
+type failWriter struct{}
+
+func (f *failWriter) Read(p []byte) (int, error)  { return 0, io.EOF }
+func (f *failWriter) Write(p []byte) (int, error) { return 0, errors.New("write failed") }
 
 // readOnlyRW wraps a byte slice as an io.ReadWriter whose Write is a no-op
 // discard. Used to feed pre-encoded wire bytes into NewFramer for decode tests
@@ -570,4 +577,134 @@ func BenchmarkEOMReader_4KB(b *testing.B) {
 		}
 		rc.Close()
 	}
+}
+
+// ── Additional coverage tests ─────────────────────────────────────────────────
+
+func TestFramer_Close_IsNoop(t *testing.T) {
+	t.Parallel()
+	framer := transport.NewFramer(&bytes.Buffer{})
+	require.NoError(t, framer.Close(), "Framer.Close must return nil")
+}
+
+func TestChunkedReader_CloseBeforeFullyRead(t *testing.T) {
+	t.Parallel()
+	// Two-chunk message: close the reader after reading only part of chunk 1.
+	part1 := "AAAAAAAAAA" // 10 bytes
+	part2 := "BBBBBBBBBB" // 10 bytes
+	wire := fmt.Appendf(nil, "\n#%d\n%s\n#%d\n%s\n##\n",
+		len(part1), part1, len(part2), part2)
+
+	// Append a second complete message so we can verify stream position.
+	msg2 := "<ok/>"
+	wire = fmt.Appendf(wire, "\n#%d\n%s\n##\n", len(msg2), msg2)
+
+	framer := transport.NewFramer(newReadOnlyRW(wire))
+	framer.Upgrade()
+
+	// First message: read only 3 bytes, then close (drain remaining).
+	r1, err := framer.MsgReader()
+	require.NoError(t, err)
+	buf := make([]byte, 3)
+	n, err := r1.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, 3, n)
+	require.NoError(t, r1.Close(), "Close on partially-read chunked reader must succeed")
+
+	// Second message: must read correctly.
+	r2, err := framer.MsgReader()
+	require.NoError(t, err)
+	got, err := io.ReadAll(r2)
+	require.NoError(t, err)
+	require.NoError(t, r2.Close())
+	assert.Equal(t, msg2, string(got), "second message after early Close must be correct")
+}
+
+func TestChunked_MsgReader_EmptyMessage(t *testing.T) {
+	t.Parallel()
+	// End-of-chunks immediately → empty message.
+	wire := []byte("\n##\n")
+	framer := transport.NewFramer(newReadOnlyRW(wire))
+	framer.Upgrade()
+
+	r, err := framer.MsgReader()
+	require.NoError(t, err, "MsgReader for empty chunked message must not error")
+
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	assert.Empty(t, got, "empty chunked message must yield zero bytes")
+}
+
+func TestChunked_ReadChunkHeader_TrailingNonNewline(t *testing.T) {
+	t.Parallel()
+	// After "##" we expect '\n', but get 'x'.
+	wire := []byte("\n##x")
+	framer := transport.NewFramer(newReadOnlyRW(wire))
+	framer.Upgrade()
+
+	_, err := framer.MsgReader()
+	require.Error(t, err, "non-newline after ## must return an error")
+	assert.Contains(t, err.Error(), "expected '\\n' after '\\n##'")
+}
+
+func TestChunked_ReadChunkHeader_EOFAfterHash(t *testing.T) {
+	t.Parallel()
+	// "\n#" with EOF — no more bytes after '#'.
+	wire := []byte("\n#")
+	framer := transport.NewFramer(newReadOnlyRW(wire))
+	framer.Upgrade()
+
+	_, err := framer.MsgReader()
+	require.Error(t, err, "EOF after '#' must return an error")
+	assert.Contains(t, err.Error(), "read after '#'")
+}
+
+func TestChunked_ReadChunkHeader_NonDigitInSize(t *testing.T) {
+	t.Parallel()
+	// "\n#12x\n" — 'x' is a non-digit within the size field.
+	wire := []byte("\n#12x\ndata\n##\n")
+	framer := transport.NewFramer(newReadOnlyRW(wire))
+	framer.Upgrade()
+
+	_, err := framer.MsgReader()
+	require.Error(t, err, "non-digit in chunk size must return an error")
+	assert.Contains(t, err.Error(), "non-digit")
+}
+
+func TestEOM_MsgReader_EmptyStream(t *testing.T) {
+	t.Parallel()
+	// Completely empty stream — EOF with no data at all.
+	framer := transport.NewFramer(newReadOnlyRW([]byte{}))
+	_, err := framer.MsgReader()
+	require.Error(t, err, "empty stream must produce an error")
+	// This should be a bare io.EOF (wrapped), not "unexpected EOF before delimiter".
+	assert.NotContains(t, err.Error(), "unexpected",
+		"bare EOF on empty stream should not say 'unexpected'")
+	assert.Contains(t, err.Error(), "EOF")
+}
+
+func TestEOM_WriteError(t *testing.T) {
+	t.Parallel()
+	framer := transport.NewFramer(&failWriter{})
+	w, err := framer.MsgWriter()
+	require.NoError(t, err, "MsgWriter itself should succeed")
+	_, err = w.Write([]byte("<hello/>"))
+	require.NoError(t, err, "Write to buffer should succeed")
+	err = w.Close()
+	require.Error(t, err, "Close must propagate write error")
+	assert.Contains(t, err.Error(), "write failed")
+}
+
+func TestChunked_WriteError(t *testing.T) {
+	t.Parallel()
+	framer := transport.NewFramer(&failWriter{})
+	framer.Upgrade()
+	w, err := framer.MsgWriter()
+	require.NoError(t, err, "MsgWriter itself should succeed")
+	_, err = w.Write([]byte("<hello/>"))
+	require.NoError(t, err, "Write to buffer should succeed")
+	err = w.Close()
+	require.Error(t, err, "Close must propagate write error")
+	assert.Contains(t, err.Error(), "write failed")
 }

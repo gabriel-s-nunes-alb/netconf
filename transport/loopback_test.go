@@ -237,3 +237,34 @@ func TestLoopback_ImplementsTransport(t *testing.T) {
 	var _ transport.Upgrader = client
 	var _ transport.Upgrader = server
 }
+
+// ── Additional loopback coverage tests ────────────────────────────────────────
+
+func TestWriteMsg_WriterBodyError(t *testing.T) {
+	t.Parallel()
+	client, server := transport.NewLoopback()
+	// Close server so the pipe that client writes into is broken.
+	require.NoError(t, server.Close())
+
+	err := transport.WriteMsg(client, []byte("<hello/>"))
+	require.Error(t, err, "WriteMsg on broken pipe must error")
+}
+
+func TestReadMsg_EmptyReadCloser(t *testing.T) {
+	t.Parallel()
+	client, server := transport.NewLoopback()
+	// Close client so server's read end sees EOF.
+	require.NoError(t, client.Close())
+
+	_, err := transport.ReadMsg(server)
+	require.Error(t, err, "ReadMsg from closed peer must error")
+}
+
+func TestLoopback_Close_WriteSideErrors(t *testing.T) {
+	t.Parallel()
+	client, _ := transport.NewLoopback()
+	require.NoError(t, client.Close())
+
+	err := transport.WriteMsg(client, []byte("<rpc/>"))
+	require.Error(t, err, "WriteMsg after Close must error")
+}
