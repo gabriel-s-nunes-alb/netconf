@@ -76,13 +76,12 @@ func NewFramer(rw io.ReadWriter) *Framer {
 }
 
 // Upgrade switches the Framer from EOM framing to chunked framing.
-// It must be called at most once, after the hello exchange. Calling Upgrade on
-// a Framer already in chunked mode panics.
+// It is safe to call multiple times; repeated calls are no-ops.
 func (f *Framer) Upgrade() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.mode == modeChunked {
-		panic("transport.Framer.Upgrade: already in chunked mode")
+		return
 	}
 	f.mode = modeChunked
 }
@@ -325,12 +324,18 @@ type eomWriter struct {
 }
 
 func (w *eomWriter) Write(p []byte) (int, error) {
+	if w.buf == nil {
+		return 0, errors.New("eom: write on closed writer")
+	}
 	return w.buf.Write(p)
 }
 
 // Close frames the accumulated body with the EOM delimiter, flushes it, and
 // returns the buffer to the pool.
 func (w *eomWriter) Close() error {
+	if w.buf == nil {
+		return nil
+	}
 	w.buf.WriteString(eomDelimiter)
 	_, err := w.w.Write(w.buf.Bytes())
 	putBuf(w.buf)
@@ -354,12 +359,18 @@ type chunkedWriter struct {
 }
 
 func (w *chunkedWriter) Write(p []byte) (int, error) {
+	if w.buf == nil {
+		return 0, errors.New("chunked: write on closed writer")
+	}
 	return w.buf.Write(p)
 }
 
 // Close encodes the buffered body as chunked framing, flushes, and returns the
 // buffer to the pool.
 func (w *chunkedWriter) Close() error {
+	if w.buf == nil {
+		return nil
+	}
 	var out strings.Builder
 
 	if w.buf.Len() > 0 {
