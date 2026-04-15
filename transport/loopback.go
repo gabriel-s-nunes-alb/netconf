@@ -79,7 +79,7 @@ func (t *LoopbackTransport) Close() error {
 }
 
 // Upgrade switches this end of the loopback from EOM to chunked framing.
-// Implements Upgrader. Panics if called a second time.
+// Implements Upgrader. Repeated calls are no-ops.
 func (t *LoopbackTransport) Upgrade() {
 	t.framer.Upgrade()
 }

@@ -457,13 +457,46 @@ func TestUpgrade_SwitchesMode_MidStream(t *testing.T) {
 		"chunked wire must not contain EOM delimiter")
 }
 
-func TestUpgrade_PanicsIfCalledTwice(t *testing.T) {
+func TestUpgrade_CalledTwice_NoPanic(t *testing.T) {
 	t.Parallel()
 	framer := transport.NewFramer(&bytes.Buffer{})
 	framer.Upgrade()
-	assert.Panics(t, func() {
+	assert.NotPanics(t, func() {
 		framer.Upgrade()
-	}, "second Upgrade must panic")
+	}, "second Upgrade must be a no-op")
+}
+
+func TestEOMWriter_CloseIdempotent_AndWriteAfterCloseErrors(t *testing.T) {
+	t.Parallel()
+	framer := transport.NewFramer(&bytes.Buffer{})
+	w, err := framer.MsgWriter()
+	require.NoError(t, err)
+
+	_, err = w.Write([]byte("<hello/>"))
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+	require.NoError(t, w.Close(), "second close should be a no-op")
+
+	_, err = w.Write([]byte("<rpc/>"))
+	require.Error(t, err, "write after close must fail")
+	assert.Contains(t, err.Error(), "closed")
+}
+
+func TestChunkedWriter_CloseIdempotent_AndWriteAfterCloseErrors(t *testing.T) {
+	t.Parallel()
+	framer := transport.NewFramer(&bytes.Buffer{})
+	framer.Upgrade()
+	w, err := framer.MsgWriter()
+	require.NoError(t, err)
+
+	_, err = w.Write([]byte("<hello/>"))
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+	require.NoError(t, w.Close(), "second close should be a no-op")
+
+	_, err = w.Write([]byte("<rpc/>"))
+	require.Error(t, err, "write after close must fail")
+	assert.Contains(t, err.Error(), "closed")
 }
 
 // ── Benchmarks ────────────────────────────────────────────────────────────────
