@@ -2,6 +2,7 @@ package netconf_test
 
 import (
 	"encoding/xml"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -322,4 +323,187 @@ func TestSession_LocalCapabilitiesAccessor(t *testing.T) {
 	assert.True(t, cliSess.LocalCapabilities().Contains(netconf.BaseCap10))
 	assert.True(t, srvSess.LocalCapabilities().Contains(netconf.BaseCap10))
 	assert.True(t, srvSess.LocalCapabilities().Contains(netconf.BaseCap11))
+}
+
+// ── Close / Send / Recv ───────────────────────────────────────────────────────
+
+func TestSession_Close_Send_Recv(t *testing.T) {
+	t.Parallel()
+	clientT, serverT := transport.NewLoopback()
+	defer clientT.Close()
+	defer serverT.Close()
+
+	serverCaps := caps(netconf.BaseCap10)
+	clientCaps := caps(netconf.BaseCap10)
+
+	var (
+		wg      sync.WaitGroup
+		srvSess *netconf.Session
+		srvErr  error
+	)
+	wg.Go(func() {
+		srvSess, srvErr = netconf.ServerSession(serverT, serverCaps, 10)
+	})
+
+	cliSess, cliErr := netconf.ClientSession(clientT, clientCaps)
+	wg.Wait()
+
+	require.NoError(t, srvErr)
+	require.NoError(t, cliErr)
+
+	// Client sends a message, server receives it.
+	msg := []byte("<rpc/>")
+	var (
+		recvData []byte
+		recvErr  error
+	)
+	wg.Go(func() {
+		recvData, recvErr = srvSess.Recv()
+	})
+	require.NoError(t, cliSess.Send(msg))
+	wg.Wait()
+	require.NoError(t, recvErr)
+	assert.Equal(t, msg, recvData)
+
+	// Server sends a reply, client receives it.
+	reply := []byte("<rpc-reply/>")
+	wg.Go(func() {
+		recvData, recvErr = cliSess.Recv()
+	})
+	require.NoError(t, srvSess.Send(reply))
+	wg.Wait()
+	require.NoError(t, recvErr)
+	assert.Equal(t, reply, recvData)
+
+	// Close both sessions.
+	assert.NoError(t, cliSess.Close())
+	assert.NoError(t, srvSess.Close())
+}
+
+// ── RecvStream ────────────────────────────────────────────────────────────────
+
+func TestSession_RecvStream(t *testing.T) {
+	t.Parallel()
+	clientT, serverT := transport.NewLoopback()
+	defer clientT.Close()
+	defer serverT.Close()
+
+	serverCaps := caps(netconf.BaseCap10)
+	clientCaps := caps(netconf.BaseCap10)
+
+	var (
+		wg      sync.WaitGroup
+		srvSess *netconf.Session
+		srvErr  error
+	)
+	wg.Go(func() {
+		srvSess, srvErr = netconf.ServerSession(serverT, serverCaps, 20)
+	})
+
+	cliSess, cliErr := netconf.ClientSession(clientT, clientCaps)
+	wg.Wait()
+
+	require.NoError(t, srvErr)
+	require.NoError(t, cliErr)
+
+	msg := []byte("<notification/>")
+
+	// Client sends, server reads via RecvStream.
+	var (
+		streamData []byte
+		streamErr  error
+	)
+	wg.Go(func() {
+		var rc io.ReadCloser
+		rc, streamErr = srvSess.RecvStream()
+		if streamErr != nil {
+			return
+		}
+		defer rc.Close()
+		streamData, streamErr = io.ReadAll(rc)
+	})
+	require.NoError(t, cliSess.Send(msg))
+	wg.Wait()
+
+	require.NoError(t, streamErr)
+	assert.Equal(t, msg, streamData)
+}
+
+// ── negotiateFraming error: transport without Upgrader ────────────────────────
+
+// nonUpgraderTransport wraps a Transport but does NOT implement Upgrader.
+type nonUpgraderTransport struct {
+	t transport.Transport
+}
+
+func (n *nonUpgraderTransport) MsgReader() (io.ReadCloser, error) { return n.t.MsgReader() }
+func (n *nonUpgraderTransport) MsgWriter() (io.WriteCloser, error) { return n.t.MsgWriter() }
+func (n *nonUpgraderTransport) Close() error                      { return n.t.Close() }
+
+func TestSession_NegotiateFraming_NonUpgrader(t *testing.T) {
+	t.Parallel()
+	clientT, serverT := transport.NewLoopback()
+	defer clientT.Close()
+	defer serverT.Close()
+
+	// Wrap the client side so it loses the Upgrader interface.
+	wrapped := &nonUpgraderTransport{t: clientT}
+
+	bothCaps := caps(netconf.BaseCap10, netconf.BaseCap11)
+
+	// Server side: manually write a hello and drain the client hello.
+	// We can't use ServerSession on the non-upgrader side, so we drive the
+	// server raw on the real LoopbackTransport.
+	done := make(chan error, 1)
+	go func() {
+		h := netconf.Hello{
+			Capabilities: []string{netconf.BaseCap10, netconf.BaseCap11},
+			SessionID:    50,
+		}
+		data, _ := xml.Marshal(&h)
+		if err := transport.WriteMsg(serverT, data); err != nil {
+			done <- err
+			return
+		}
+		// Drain the client hello so the pipe doesn't deadlock.
+		_, err := transport.ReadMsg(serverT)
+		done <- err
+	}()
+
+	_, err := netconf.ClientSession(wrapped, bothCaps)
+	require.Error(t, err, "ClientSession must fail when transport lacks Upgrader")
+	assert.Contains(t, err.Error(), "framing upgrade required but transport does not implement Upgrader")
+
+	<-done
+}
+
+// ── client rejects hello with missing session-id ──────────────────────────────
+
+func TestSession_ClientRejects_MissingSessionID(t *testing.T) {
+	t.Parallel()
+	clientT, serverT := transport.NewLoopback()
+	defer clientT.Close()
+	defer serverT.Close()
+
+	// Server side: send a hello with base:1.0 but session-id=0 (omitted).
+	done := make(chan error, 1)
+	go func() {
+		h := netconf.Hello{
+			Capabilities: []string{netconf.BaseCap10},
+			SessionID:    0, // omitempty → missing in XML
+		}
+		data, _ := xml.Marshal(&h)
+		if err := transport.WriteMsg(serverT, data); err != nil {
+			done <- err
+			return
+		}
+		_, err := transport.ReadMsg(serverT)
+		done <- err
+	}()
+
+	_, err := netconf.ClientSession(clientT, caps(netconf.BaseCap10))
+	require.Error(t, err, "ClientSession must fail when server hello lacks session-id")
+	assert.Contains(t, err.Error(), "missing session-id")
+
+	<-done
 }
