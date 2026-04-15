@@ -80,7 +80,7 @@ func (t *ServerTransport) Close() error {
 }
 
 // Upgrade switches the transport from EOM to chunked framing.
-// Implements transport.Upgrader. Panics if called twice.
+// Implements transport.Upgrader. Repeated calls are no-ops.
 func (t *ServerTransport) Upgrade() {
 	t.framer.Upgrade()
 }
