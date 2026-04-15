@@ -575,3 +575,122 @@ func TestEnforce_AccessOperations_NoExec(t *testing.T) {
 	assert.Equal(t, nacm.DefaultDeny, nacm.Enforce(cfg, req),
 		"read-only access-operations must not match protocol-operation exec request")
 }
+
+// ─── TestDecisionString_Unknown ───────────────────────────────────────────────
+
+// TestDecisionString_Unknown verifies that an out-of-range Decision value
+// returns "unknown" from String().
+func TestDecisionString_Unknown(t *testing.T) {
+	t.Parallel()
+	d := nacm.Decision(99)
+	assert.Equal(t, "unknown", d.String())
+}
+
+// ─── TestEnforce_UnknownOperationType ─────────────────────────────────────────
+
+// TestEnforce_UnknownOperationType verifies that a request with an
+// OperationType not equal to OpProtocolOperation or OpNotification causes
+// ruleTypeMatches to return false, so no rule matches and DefaultDeny is
+// returned.
+func TestEnforce_UnknownOperationType(t *testing.T) {
+	t.Parallel()
+	cfg := nacm.Nacm{
+		EnableNacm: true,
+		RuleLists: []nacm.RuleList{
+			{
+				Name:  "catch-all",
+				Group: []string{},
+				Rules: []nacm.Rule{
+					{
+						Name:              "permit-proto",
+						ProtocolOperation: &nacm.ProtocolOperationRule{RPCName: "*"},
+						AccessOperations:  "*",
+						Action:            nacm.ActionPermit,
+					},
+					{
+						Name:             "permit-notif",
+						Notification:     &nacm.NotificationRule{NotificationName: "*"},
+						AccessOperations: "*",
+						Action:           nacm.ActionPermit,
+					},
+				},
+			},
+		},
+	}
+
+	req := nacm.Request{
+		User:          "alice",
+		Groups:        []string{"admin"},
+		OperationType: nacm.OperationType(99),
+		OperationName: "something",
+		ModuleName:    "some-module",
+	}
+	assert.Equal(t, nacm.DefaultDeny, nacm.Enforce(cfg, req),
+		"unknown OperationType must not match any rule")
+}
+
+// ─── TestEnforce_ProtocolOpAgainstNotificationRule ────────────────────────────
+
+// TestEnforce_ProtocolOpAgainstNotificationRule verifies that a protocol
+// operation request does not match a notification-only rule (ProtocolOperation
+// is nil), exercising the nil-check branch in ruleTypeMatches.
+func TestEnforce_ProtocolOpAgainstNotificationRule(t *testing.T) {
+	t.Parallel()
+	cfg := nacm.Nacm{
+		EnableNacm: true,
+		RuleLists: []nacm.RuleList{
+			{
+				Name:  "notif-only-rules",
+				Group: []string{},
+				Rules: []nacm.Rule{
+					{
+						Name:             "permit-notif",
+						Notification:     &nacm.NotificationRule{NotificationName: "*"},
+						AccessOperations: "*",
+						Action:           nacm.ActionPermit,
+					},
+				},
+			},
+		},
+	}
+
+	req := mkProtocolOpRequest("alice", []string{"admin"}, "ietf-netconf", "get")
+	assert.Equal(t, nacm.DefaultDeny, nacm.Enforce(cfg, req),
+		"protocol-operation request must not match notification-only rule")
+}
+
+// ─── TestEnforce_AccessOperations_UnknownOpType ───────────────────────────────
+
+// TestEnforce_AccessOperations_UnknownOpType verifies that
+// accessOperationMatches returns false for an unknown OperationType when
+// AccessOperations is a non-wildcard string, exercising the default branch.
+func TestEnforce_AccessOperations_UnknownOpType(t *testing.T) {
+	t.Parallel()
+	cfg := nacm.Nacm{
+		EnableNacm: true,
+		RuleLists: []nacm.RuleList{
+			{
+				Name:  "catch-all",
+				Group: []string{},
+				Rules: []nacm.Rule{
+					{
+						Name:             "permit-notif",
+						Notification:     &nacm.NotificationRule{NotificationName: "*"},
+						AccessOperations: "exec read",
+						Action:           nacm.ActionPermit,
+					},
+				},
+			},
+		},
+	}
+
+	req := nacm.Request{
+		User:          "alice",
+		Groups:        []string{"admin"},
+		OperationType: nacm.OperationType(99),
+		OperationName: "something",
+		ModuleName:    "some-module",
+	}
+	assert.Equal(t, nacm.DefaultDeny, nacm.Enforce(cfg, req),
+		"unknown OperationType with non-wildcard access-operations must not match")
+}
