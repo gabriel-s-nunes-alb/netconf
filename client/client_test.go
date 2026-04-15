@@ -1629,10 +1629,10 @@ func TestClient_checkReply_MalformedXML(t *testing.T) {
 	assert.True(t, errors.As(err, &rpcErr))
 }
 
-// TestClient_checkDataReply_MalformedXML exercises the parse-error/decode path in
-// checkDataReply (indirectly through Get) when reply body is not a valid <data>
-// element but is valid enough XML that ParseRPCErrors passes through.
-func TestClient_checkDataReply_MalformedXML(t *testing.T) {
+// TestClient_checkDataReply_DecodeError exercises the XML decode error path in
+// checkDataReply (indirectly through Get) when reply body is valid XML but
+// not a <data> element, causing xml.Unmarshal to fail with a type mismatch.
+func TestClient_checkDataReply_DecodeError(t *testing.T) {
 	c, serverT := newTestPair(t)
 
 	go func() {
@@ -1641,8 +1641,8 @@ func TestClient_checkDataReply_MalformedXML(t *testing.T) {
 		var rpc netconf.RPC
 		require.NoError(t, xml.Unmarshal(raw, &rpc))
 		// Reply with body that is valid XML but not a <data> element.
-		// checkDataReply will call xml.Unmarshal into DataReply which will
-		// not find data content, or will fail to decode properly.
+		// checkDataReply's xml.Unmarshal into DataReply will fail because
+		// the root element is <not-data> instead of <data>.
 		writeReply(t, serverT, &netconf.RPCReply{
 			MessageID: rpc.MessageID,
 			Body:      []byte(`<not-data>some content</not-data>`),
@@ -1650,8 +1650,7 @@ func TestClient_checkDataReply_MalformedXML(t *testing.T) {
 	}()
 
 	_, err := c.Get(context.Background(), nil)
-	// checkDataReply should return a non-nil DataReply (with empty content)
-	// or an error from the XML decode. Either way, we should not hang.
-	// The DataReply.Content will be empty since <not-data> doesn't map to <data>.
-	_ = err
+	require.Error(t, err, "Get must error when reply body is not a <data> element")
+	assert.Contains(t, err.Error(), "decode DataReply",
+		"error must mention DataReply decode failure")
 }
