@@ -770,3 +770,277 @@ func TestServer_StreamHandler_FallsBackToHandler(t *testing.T) {
 
 	sendCloseSession(t, clientSess, serveDone)
 }
+
+// ── additional coverage tests ─────────────────────────────────────────────────
+
+// TestServer_ContextCancellation creates a session pair, starts Serve with a
+// cancellable context, cancels the context and verifies Serve returns an error
+// containing "context".
+func TestServer_ContextCancellation(t *testing.T) {
+	t.Parallel()
+	_, serverSess := newTestPair(t)
+
+	srv := server.NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.Serve(ctx, serverSess)
+	}()
+
+	cancel()
+
+	select {
+	case err := <-serveDone:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "context")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after context cancellation")
+	}
+}
+
+// TestServer_MalformedRPC_SkippedSilently sends a message that is NOT a valid
+// RPC (<not-an-rpc/> without message-id). The server should skip it and
+// continue. A subsequent close-session proves Serve continues and returns nil.
+func TestServer_MalformedRPC_SkippedSilently(t *testing.T) {
+	t.Parallel()
+	clientSess, serverSess := newTestPair(t)
+
+	srv := server.NewServer()
+	serveDone := runServe(t, srv, serverSess)
+
+	// Not a valid RPC — missing message-id, skipped by parseRPCHeader.
+	require.NoError(t, clientSess.Send([]byte(`<not-an-rpc/>`)))
+
+	// Serve should continue after skipping the malformed message.
+	sendCloseSession(t, clientSess, serveDone)
+}
+
+// streamHandlerFunc implements both Handler and StreamHandler via a function.
+type streamHandlerFunc struct {
+	fn func(ctx context.Context, sess *netconf.Session, rpc *netconf.RPC, dec *xml.Decoder, opStart xml.StartElement) ([]byte, error)
+}
+
+func (s *streamHandlerFunc) Handle(_ context.Context, _ *netconf.Session, _ *netconf.RPC) ([]byte, error) {
+	return nil, errors.New("should not be called")
+}
+
+func (s *streamHandlerFunc) HandleStream(ctx context.Context, sess *netconf.Session, rpc *netconf.RPC, dec *xml.Decoder, opStart xml.StartElement) ([]byte, error) {
+	return s.fn(ctx, sess, rpc, dec, opStart)
+}
+
+// TestServer_StreamHandler registers a handler that implements StreamHandler.
+// Verifies that HandleStream (not Handle) is called with the decoder positioned
+// at the operation start element.
+func TestServer_StreamHandler(t *testing.T) {
+	t.Parallel()
+	clientSess, serverSess := newTestPair(t)
+
+	const replyBody = `<data><result/></data>`
+	h := &streamHandlerFunc{
+		fn: func(_ context.Context, _ *netconf.Session, _ *netconf.RPC, dec *xml.Decoder, opStart xml.StartElement) ([]byte, error) {
+			type opCapture struct {
+				Inner []byte `xml:",innerxml"`
+			}
+			var cap opCapture
+			if err := dec.DecodeElement(&cap, &opStart); err != nil {
+				return nil, err
+			}
+			return []byte(replyBody), nil
+		},
+	}
+
+	srv := server.NewServer()
+	srv.RegisterHandler("get", h)
+	serveDone := runServe(t, srv, serverSess)
+
+	sendRPC(t, clientSess, "50", []byte(`<get xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"><filter/></get>`))
+
+	reply := recvReply(t, clientSess)
+	assert.Equal(t, "50", reply.MessageID)
+	assert.Contains(t, string(reply.Body), replyBody)
+
+	sendCloseSession(t, clientSess, serveDone)
+}
+
+// TestServer_RPCMissingMessageID sends <rpc><get/></rpc> (missing message-id
+// attribute). The server should skip it and continue.
+func TestServer_RPCMissingMessageID(t *testing.T) {
+	t.Parallel()
+	clientSess, serverSess := newTestPair(t)
+
+	srv := server.NewServer()
+	serveDone := runServe(t, srv, serverSess)
+
+	// <rpc> without message-id — parseRPCHeader returns !ok.
+	require.NoError(t, clientSess.Send([]byte(`<rpc><get/></rpc>`)))
+
+	sendCloseSession(t, clientSess, serveDone)
+}
+
+// TestServer_RPCNoOperationElement sends <rpc message-id="1"></rpc> (message-id
+// present but no child operation element). The server should skip it.
+func TestServer_RPCNoOperationElement(t *testing.T) {
+	t.Parallel()
+	clientSess, serverSess := newTestPair(t)
+
+	srv := server.NewServer()
+	serveDone := runServe(t, srv, serverSess)
+
+	// message-id present but no child element — child loop hits EOF.
+	require.NoError(t, clientSess.Send([]byte(`<rpc message-id="1"></rpc>`)))
+
+	sendCloseSession(t, clientSess, serveDone)
+}
+
+// TestServer_EmptyMessage_SkippedSilently sends a whitespace-only message.
+// The XML decoder's first Token call returns CharData, then EOF on the second
+// call, triggering the parseRPCHeader error path for the initial token loop.
+func TestServer_EmptyMessage_SkippedSilently(t *testing.T) {
+	t.Parallel()
+	clientSess, serverSess := newTestPair(t)
+
+	srv := server.NewServer()
+	serveDone := runServe(t, srv, serverSess)
+
+	// Whitespace-only message — Token returns CharData then EOF.
+	require.NoError(t, clientSess.Send([]byte(`   `)))
+
+	sendCloseSession(t, clientSess, serveDone)
+}
+
+// TestServer_MarshalOpElementError sends a message with a valid RPC header but
+// a truncated operation body so that marshalOpElement's DecodeElement fails.
+// The server should skip the malformed body and continue.
+func TestServer_MarshalOpElementError(t *testing.T) {
+	t.Parallel()
+	clientSess, serverSess := newTestPair(t)
+
+	srv := server.NewServer()
+	// Register a plain Handler (not StreamHandler) so the marshalOpElement
+	// code path is taken.
+	srv.RegisterHandler("get", server.HandlerFunc(
+		func(_ context.Context, _ *netconf.Session, _ *netconf.RPC) ([]byte, error) {
+			return nil, nil
+		},
+	))
+	serveDone := runServe(t, srv, serverSess)
+
+	// Truncated body: <get> has no closing tag → DecodeElement fails.
+	require.NoError(t, clientSess.Send([]byte(`<rpc message-id="1"><get>`)))
+
+	sendCloseSession(t, clientSess, serveDone)
+}
+
+// TestServer_SendReplyError verifies that Serve returns an error when
+// sendReply fails because the handler closed the transport.
+func TestServer_SendReplyError(t *testing.T) {
+	t.Parallel()
+	clientSess, serverSess := newTestPair(t)
+
+	srv := server.NewServer()
+	srv.RegisterHandler("get", server.HandlerFunc(
+		func(_ context.Context, _ *netconf.Session, _ *netconf.RPC) ([]byte, error) {
+			// Close the server transport so the subsequent sendReply fails.
+			serverSess.Close()
+			return []byte(`<data/>`), nil
+		},
+	))
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.Serve(context.Background(), serverSess)
+	}()
+
+	sendRPC(t, clientSess, "1", []byte(`<get xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"/>`))
+
+	select {
+	case err := <-serveDone:
+		require.Error(t, err, "Serve must return an error when sendReply fails")
+		assert.Contains(t, err.Error(), "send reply")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return")
+	}
+}
+
+// TestServer_RecvError verifies that Serve returns a recv error (not context)
+// when the transport is closed externally.
+func TestServer_RecvError(t *testing.T) {
+	t.Parallel()
+	clientSess, serverSess := newTestPair(t)
+
+	srv := server.NewServer()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.Serve(context.Background(), serverSess)
+	}()
+
+	// Close the client transport — server recv fails with a pipe error.
+	require.NoError(t, clientSess.Close())
+
+	select {
+	case err := <-serveDone:
+		require.Error(t, err, "Serve must return an error on transport failure")
+		assert.Contains(t, err.Error(), "recv")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return")
+	}
+}
+
+// TestServer_CloseSession_SendReplyError verifies that Serve returns an error
+// when the ok reply for close-session cannot be sent because the client
+// transport was closed.
+func TestServer_CloseSession_SendReplyError(t *testing.T) {
+	t.Parallel()
+	clientSess, serverSess := newTestPair(t)
+
+	srv := server.NewServer()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.Serve(context.Background(), serverSess)
+	}()
+
+	// Send close-session. sendRPC blocks until server reads the message.
+	sendRPC(t, clientSess, "close", []byte(`<close-session xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"/>`))
+
+	// Close the client transport immediately. The server's reply write to
+	// serverW blocks (synchronous pipe) or fails because clientR is closed.
+	require.NoError(t, clientSess.Close())
+
+	select {
+	case err := <-serveDone:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "send close-session reply")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return")
+	}
+}
+
+// TestServer_OperationNotSupported_SendReplyError verifies that Serve returns
+// an error when the operation-not-supported reply cannot be sent because the
+// client transport was closed.
+func TestServer_OperationNotSupported_SendReplyError(t *testing.T) {
+	t.Parallel()
+	clientSess, serverSess := newTestPair(t)
+
+	srv := server.NewServer()
+	// No handlers registered → any operation gets operation-not-supported.
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.Serve(context.Background(), serverSess)
+	}()
+
+	// Send an unknown operation. sendRPC blocks until server reads.
+	sendRPC(t, clientSess, "1", []byte(`<frobnicate xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"/>`))
+
+	// Close client transport — server's error reply send will fail.
+	require.NoError(t, clientSess.Close())
+
+	select {
+	case err := <-serveDone:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "send")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return")
+	}
+}
